@@ -53,7 +53,7 @@ class LLaMAConfigurator(object):
         config.num_hidden_layers = 32
         config.num_attention_heads = 32
         config.num_key_value_heads = 32
-        config.initializer_range = 0.02
+        config.initializer_range = 1.0
         config.rms_norm_eps = 1e-6
         config.max_position_embeddings = 2048
         config.rope_theta = 10000.0
