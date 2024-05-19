@@ -56,7 +56,7 @@ class LLaMAConfigurator(object):
         config.initializer_range = 1.0
         config.rms_norm_eps = 1e-6
         config.max_position_embeddings = 2048
-        config.rope_theta = 10000.0
+        config.rope_theta = 1e4
         config.embedding_dropout = 0.0
         config.feedforward_dropout = 0.0
         config.attention_dropout = 0.0
@@ -136,6 +136,7 @@ class LLaMAConfigurator(object):
                 num_key_value_heads=8,
                 max_position_embeddings=8192,
                 rms_norm_eps=1e-5,
+                rope_theta=5e5,
             ),
         }[model_name]
         return mlxu.update_config_dict(config, updates)
