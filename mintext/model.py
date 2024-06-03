@@ -2,14 +2,17 @@ from functools import partial
 from typing import Union
 
 import numpy as np
+import mlxu
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as PS
 import flax
 import flax.linen as nn
 import einops
 
-from scalax.sharding import with_sharding_annotation
-import mlxu
+from scalax.sharding import (
+    MeshShardingHelper, TreePathShardingRule, with_sharding_annotation
+)
 
 
 class LLaMAConfigurator(object):
@@ -183,6 +186,54 @@ class LLaMAConfigurator(object):
         }[model_name]
         return mlxu.update_config_dict(config, updates)
 
+    @classmethod
+    def get_model_sharding_rule(cls):
+        """ Get the tree path based partition rule for LLaMA model. """
+        return TreePathShardingRule(
+            # embeddings
+            ('transformer/wte/embedding', PS('tensor', 'fsdp')),
+            # atention
+            ('Attention_*/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'tensor')),
+            ('Attention_*/o_proj/kernel', PS('tensor', 'fsdp')),
+            # mlp
+            ('FeedForward_*/up_proj/kernel', PS('fsdp', 'tensor')),
+            ('FeedForward_*/down_proj/kernel', PS('tensor', 'fsdp')),
+            ('FeedForward_*/gate_proj/kernel', PS('fsdp', 'tensor')),
+            # layer norms
+            ('input_layernorm/scale', PS(None)),
+            ('post_attention_layernorm/scale', PS(None)),
+            # output head
+            ('lm_head_norm/scale', PS(None)),
+            ('lm_head/kernel', PS('fsdp', 'tensor')),
+            ('.*', PS(None)),
+        )
+
+    @classmethod
+    def get_intermediate_sharding_rules(cls):
+        return {
+            'data': PS(('replica', 'fsdp')),
+            'ffw_intermediate': PS(('replica', 'fsdp'), None, 'tensor'),
+            'attention_kqv': PS(('replica', 'fsdp'), 'tensor', None),
+        }
+
+    @classmethod
+    def get_jax_mesh(cls, axis_dims):
+        if axis_dims.startswith('!'):
+            # Allow splitting a physical mesh axis if needed
+            mesh_axis_splitting = True
+            axis_dims = axis_dims[1:]
+        else:
+            mesh_axis_splitting = False
+
+        names = ('replica', 'fsdp', 'tensor')
+        dims = [int(x) for x in axis_dims.split(',')]
+        assert len(dims) == len(names)
+        return MeshShardingHelper(dims, names, mesh_axis_splitting)
+
+    @classmethod
+    def rng_keys(cls):
+        return ('params', 'dropout')
+
 
 def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
     input_dtype = xq.dtype
@@ -248,7 +299,11 @@ class FeedForward(nn.Module):
             ),
             name='up_proj',
         )
-        x = w2(nn.silu(w1(x)) * w3(x))
+        x = w2(
+            nn.silu(with_sharding_annotation(w1(x), 'ffw_intermediate'))
+            * with_sharding_annotation(w3(x), 'ffw_intermediate')
+        )
+        x = with_sharding_annotation(x, 'ffw_output')
         return nn.Dropout(rate=self.config.feedforward_dropout)(x, deterministic=deterministic)
 
 
@@ -306,6 +361,10 @@ class Attention(nn.Module):
             g=num_query_groups,
         )
 
+        xq = with_sharding_annotation(xq, 'attention_kqv')
+        xk = with_sharding_annotation(xk, 'attention_kqv')
+        xv = with_sharding_annotation(xv, 'attention_kqv')
+
         xq, xk = apply_rotary_emb(
             xq, xk, position_ids,
             max_pos=self.config.max_position_embeddings,
@@ -329,7 +388,7 @@ class Attention(nn.Module):
 
         dropout_rng = None
         if not deterministic and self.config.attention_dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
+            dropout_rng = self.make_rng('dropout')
 
         attn_weights = nn.attention.dot_product_attention_weights(
             xq,
@@ -340,8 +399,7 @@ class Attention(nn.Module):
             deterministic=deterministic,
             dtype=jnp.promote_types(self.dtype, jnp.float32),
         )
-        # attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
-        attention_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv)
+        attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
         attention_output = einops.rearrange(attention_output, 'b s h d -> b s (h d)')
 
         x_out = nn.Dense(

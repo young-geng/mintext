@@ -8,6 +8,7 @@ from multiprocessing import Pool
 
 import mlxu
 import numpy as np
+import einops
 
 
 class TextProcessor(object):
@@ -105,9 +106,8 @@ class JsonDataset(object):
         config = mlxu.config_dict()
         config.text_processor = TextProcessor.get_default_config()
         config.path = ''
-        config.seq_length = 1024
+        config.seq_length = 2048
         config.batch_size = 8
-        config.always_start_with_bos = False
         config.start_seek_loc = 0
         config.example_index_at_start = 0
         config.tokens_count_at_start = 0
@@ -225,9 +225,15 @@ class JsonDataset(object):
                     'loss_masks': np.array(loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(
                         self.config.batch_size, -1
                     ),
+                    'attention_mask': np.ones(
+                        (self.config.batch_size, self.config.seq_length), dtype=np.int32
+                    ),
+                    'position_ids': einops.repeat(
+                        np.arange(self.config.seq_length, dtype=np.int32),
+                        's -> b s',
+                        b=self.config.batch_size,
+                    )
                 }
-                if self.config.always_start_with_bos:
-                    batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
                 yield batch, metrics
                 token_buffer = token_buffer[chunk_size:]
                 loss_mask_buffer = loss_mask_buffer[chunk_size:]
