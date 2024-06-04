@@ -1,7 +1,7 @@
 from functools import partial
 import os
+import json
 import mlxu
-
 import numpy as np
 import flax
 import jax
@@ -42,57 +42,6 @@ class JaxDistributedConfigurator(object):
             )
 
 
-class Checkpointer(object):
-    """ A simple wrapper for orbax checkpointing. """
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = mlxu.config_dict()
-        config.path = ''
-        return mlxu.update_config_dict(config, updates)
-
-    def __init__(self, config):
-        self.config = self.get_default_config(config)
-        self.checkpointer = ocp.Checkpointer(
-            ocp.CompositeCheckpointHandler(
-                'train_state', 'dataset_state', 'metadata'
-            )
-        )
-
-    def save(self, train_state, dataset_state=None, metadata=None, prefix=None):
-        if self.config.path == '':
-            return
-        composite_args = {}
-        composite_args['train_state'] = ocp.args.StandardSave(train_state)
-        if dataset_state is not None:
-            composite_args['dataset_state'] = ocp.args.JsonSave(dataset_state)
-        if metadata is not None:
-            composite_args['metadata'] = ocp.args.JsonSave(metadata)
-
-        if prefix is None:
-            path = self.config.path
-        else:
-            path = os.path.join(self.config.path, prefix)
-        self.checkpointer.save(path, args=ocp.args.Composite(**composite_args))
-
-    @classmethod
-    def restore(cls, path, item):
-        return ocp.StandardCheckpointer().restore(
-            path, args=ocp.args.StandardRestore(item)
-        )
-
-    @classmethod
-    def restore_metadata(cls, path):
-        return ocp.StandardCheckpointer().restore(
-            path, args=ocp.args.JsonRestore()
-        )
-
-    @classmethod
-    def get_shape_dtype_struct(cls, tree):
-        return jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, tree)
-
-
-
 class AdamConfigurator(object):
     """ AdamW optimizer with cosine schedule. """
 
@@ -131,6 +80,49 @@ class AdamConfigurator(object):
             ),
         )
         return optimizer, learning_rate_schedule
+
+
+class Checkpointer(object):
+    """ A simple wrapper for orbax checkpointing. """
+
+    def __init__(self, path):
+        self.path = path
+        self.checkpointer = ocp.StandardCheckpointer()
+        if self.path != '':
+            mlxu.makedirs(self.path)
+
+    def save_pytree(self, pytree, prefix=None):
+        """ Save pytree of JAX arrays. """
+        if self.path == '':
+            return
+        if prefix is None:
+            path = self.path
+        else:
+            path = os.path.join(self.path, prefix)
+        self.checkpointer.save(path, pytree, force=True)
+
+    @classmethod
+    def restore_pytree(cls, path, item):
+        return ocp.StandardCheckpointer().restore(
+            path, args=ocp.args.StandardRestore(item)
+        )
+
+    def save_json(self, data, name):
+        """ Save dictionary as JSON. """
+        if self.path == '':
+            return
+        path = os.path.join(self.path, name)
+        with mlxu.open_file(path, 'w') as f:
+            f.write(json.dumps(data, indent=4))
+
+    @classmethod
+    def load_json(cls, path):
+        with mlxu.open_file(path, 'r') as f:
+            return json.loads(f.read())
+
+    @classmethod
+    def get_shape_dtype_struct(cls, tree):
+        return jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, tree)
 
 
 def get_metrics(metrics, unreplicate=False, stack=False):

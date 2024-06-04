@@ -28,8 +28,6 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     dtype='fp32',
     param_dtype='fp32',
     total_steps=10000,
-    load_llama_config='',
-    update_llama_config='',
     load_params_checkpoint='',
     load_train_state_checkpoint='',
     load_dataset_state='',
@@ -38,11 +36,12 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_milestone_freq=0,
     eval_steps=0,
     tokenizer='openlm-research/open_llama_3b_v2',
+    checkpoint_path='',
+    checkpoint_separate_params=True,
     train_dataset=JsonDataset.get_default_config(),
     eval_dataset=JsonDataset.get_default_config(),
     optimizer=AdamConfigurator.get_default_config(),
     llama=LLaMAConfigurator.get_default_config(),
-    checkpointer=Checkpointer.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfigurator.get_default_config(),
@@ -62,8 +61,6 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = JsonDataset(FLAGS.train_dataset, tokenizer)
-    if FLAGS.load_dataset_state != '':
-        dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
 
     if FLAGS.eval_steps > 0:
         eval_dataset = JsonDataset(FLAGS.eval_dataset, tokenizer)
@@ -82,8 +79,7 @@ def main(argv):
         FLAGS.optimizer
     )
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
-    checkpointer = Checkpointer(FLAGS.checkpointer)
-
+    checkpointer = Checkpointer(FLAGS.checkpoint_path)
 
     @partial(
         mesh.sjit,
@@ -183,35 +179,45 @@ def main(argv):
 
     def save_checkpoint(train_state, milestone=False):
         step = int(jax.device_get(train_state.step))
-        metadata = dict(
-            step=step,
-            variant=variant,
-            flags=flags_config_dict,
-            llama_config=llama_config.to_dict(),
+        checkpoint_name = f'step_{step}' if milestone else 'latest'
+        # Save the main train state
+        checkpointer.save_pytree(
+            train_state, prefix=f'train_state_{checkpoint_name}',
         )
-        checkpointer.save(
-            train_state=train_state,
-            metadata=metadata,
-            dataset_state=dataset.get_state_dict(),
-            prefix=f'step_{step}' if milestone else 'latest',
+        if FLAGS.checkpoint_separate_params:
+            # Optionally save the model parameters separately
+            checkpointer.save_pytree(
+                train_state.params, prefix=f'params_{checkpoint_name}',
+            )
+        # Save dataset state and training configs
+        checkpointer.save_json(
+            dataset.get_state_dict(), f'dataset_state_{checkpoint_name}.json',
         )
+        checkpointer.save_json(flags_config_dict.to_dict(), 'flags.json')
+        checkpointer.save_json(llama_config.to_dict(), 'llama_config.json')
 
     train_state = init_fn(JaxRNG.next_rng())
 
     if FLAGS.load_train_state_checkpoint != '':
+        # Loading a full train state with model params and optimizer state
+        assert FLAGS.load_params_checkpoint == '', 'Cannot load both train state and params.'
         train_state_shapes = checkpointer.get_shape_dtype_struct(train_state)
         train_state = None  # Release memory before loading
-        train_state = checkpointer.restore(
+        train_state = checkpointer.restore_pytree(
             FLAGS.load_train_state_checkpoint, train_state_shapes
         )
     elif FLAGS.load_params_checkpoint != '':
+        # Loading only the model parameters
         model_shapes = checkpointer.get_shape_dtype_struct(train_state.params)
         train_state = train_state.replace(params=None)  # Release memory before loading
         train_state = train_state.replace(
-            params=checkpointer.restore(
+            params=checkpointer.restore_pytree(
                 FLAGS.load_params_checkpoint, model_shapes
             )
         )
+
+    if FLAGS.load_dataset_state != '':
+        dataset.load_state_dict(checkpointer.load_json(FLAGS.load_dataset_state))
 
     start_step = int(jax.device_get(train_state.step))
 
