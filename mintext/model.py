@@ -240,8 +240,8 @@ def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
     with jax.ensure_compile_time_eval():
         dim = xq.shape[-1]
         freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-        t = jnp.arange(max_pos)  # type: ignore
-        freqs = jnp.outer(t, freqs).astype(jnp.float32)  # type: ignore
+        t = jnp.arange(max_pos)
+        freqs = jnp.outer(t, freqs).astype(jnp.float32)
         sin, cos = jnp.sin(freqs), jnp.cos(freqs)
         freqs_cis = jnp.complex64(cos + 1j * sin)
     freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)

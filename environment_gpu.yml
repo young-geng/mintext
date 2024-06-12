@@ -1,0 +1,29 @@
+name: mintext
+channels:
+    - pytorch
+    - conda-forge
+dependencies:
+    - python=3.10
+    - pip
+    - numpy
+    - scipy
+    - matplotlib
+    - seaborn
+    - jupyter
+    - tqdm
+    - pytorch=2.3.0
+    - cpuonly
+    - pip:
+        - jax[cuda12]==0.4.28
+        - scalax>=0.2.1
+        - flax==0.8.3
+        - optax==0.2.2
+        - transformers==4.41.0
+        - torch==2.3.0
+        - orbax-checkpoint==0.5.14
+        - sentencepiece
+        - datasets
+        - tpu_pod_commander>=0.1.1
+        - mlxu>=0.2.0
+        - einops
+        - gcsfs
