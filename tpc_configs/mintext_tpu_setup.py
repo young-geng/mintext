@@ -72,4 +72,5 @@ configure_tpc(
     project='my-project',
     zone='europe-west4-a',
     name='my-tpu-name',
+    launch_script=launch_script,
 )
