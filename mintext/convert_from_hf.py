@@ -17,7 +17,7 @@ from mintext.utils import match_and_transform_dict
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     hf_pretrained='',
     output_path='',
-    param_dtype='bf16',
+    param_dtype='fp32',
     llama=LLaMAConfigurator.get_default_config(),
 )
 
