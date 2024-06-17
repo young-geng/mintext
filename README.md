@@ -30,10 +30,10 @@ Then, install mintext by running the following commands on your local machine:
 ```bash
 git clone https://github.com/young-geng/mintext.git
 cd mintext
-tpc launch --name=your-tpu-pod-name \
+tpc launch tpc_configs/mintext_tpu_setup.py \
+    --name=your-tpu-pod-name \
     --project=your-gcp-project \
     --zone=your-zone \
-    tpc_configs/mintext_tpu_setup.py
 ```
 
 
