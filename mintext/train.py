@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
-from scalax.sharding import with_sharding_constraint, with_sharding_annotation
 from scalax.utils import JaxRNG, get_float_dtype_by_name
 from flax.training.train_state import TrainState
 from transformers import AutoTokenizer

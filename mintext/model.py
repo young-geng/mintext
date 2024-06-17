@@ -35,6 +35,7 @@ class LLaMAConfigurator(object):
         config.feedforward_dropout = mlxu.config_placeholder(float)
         config.attention_dropout = mlxu.config_placeholder(float)
         config.residue_dropout = mlxu.config_placeholder(float)
+        config.remat = mlxu.config_placeholder(str)
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
@@ -64,6 +65,7 @@ class LLaMAConfigurator(object):
         config.feedforward_dropout = 0.0
         config.attention_dropout = 0.0
         config.residue_dropout = 0.0
+        config.remat = 'block'
 
         updates = {
             'debug': dict(
@@ -193,12 +195,12 @@ class LLaMAConfigurator(object):
             # embeddings
             ('transformer/wte/embedding', PS('tensor', 'fsdp')),
             # atention
-            ('Attention_*/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'tensor')),
-            ('Attention_*/o_proj/kernel', PS('tensor', 'fsdp')),
+            ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'tensor')),
+            ('self_attention/o_proj/kernel', PS('tensor', 'fsdp')),
             # mlp
-            ('FeedForward_*/up_proj/kernel', PS('fsdp', 'tensor')),
-            ('FeedForward_*/down_proj/kernel', PS('tensor', 'fsdp')),
-            ('FeedForward_*/gate_proj/kernel', PS('fsdp', 'tensor')),
+            ('feedforward/up_proj/kernel', PS('fsdp', 'tensor')),
+            ('feedforward/down_proj/kernel', PS('tensor', 'fsdp')),
+            ('feedforward/gate_proj/kernel', PS('fsdp', 'tensor')),
             # layer norms
             ('input_layernorm/scale', PS(None)),
             ('post_attention_layernorm/scale', PS(None)),
@@ -417,7 +419,6 @@ class Attention(nn.Module):
         return x_out
 
 
-@partial(nn.remat, static_argnums=(4,))
 class TransformerBlock(nn.Module):
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
@@ -435,6 +436,7 @@ class TransformerBlock(nn.Module):
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            name='self_attention',
         )(x_out, attention_mask, position_ids, deterministic=deterministic)
         mlp_inputs = x_out + hidden_states
         x_out = nn.RMSNorm(
@@ -447,6 +449,7 @@ class TransformerBlock(nn.Module):
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            name='feedforward',
         )(x_out, deterministic=deterministic)
         return x_out + mlp_inputs
 
@@ -471,11 +474,25 @@ class LLaMAModel(nn.Module):
         hidden_states = nn.Dropout(
             rate=self.config.embedding_dropout, name='emb_drop'
         )(hidden_states, deterministic=deterministic)
-        for _ in range(self.config.num_hidden_layers):
-            hidden_states = TransformerBlock(
+
+        remat_policy = {
+            'block': jax.checkpoint_policies.nothing_saveable,
+            'dots': jax.checkpoint_policies.checkpoint_dots,
+            'dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+            'none': jax.checkpoint_policies.everything_saveable,
+        }
+        block_module = nn.remat(
+            TransformerBlock,
+            policy=remat_policy[self.config.remat],
+            static_argnums=(4,),
+        )
+
+        for i in range(self.config.num_hidden_layers):
+            hidden_states = block_module(
                 self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
+                name=f'transformer_block_{i}',
             )(hidden_states, attention_mask, position_ids, deterministic)
 
         hidden_states = nn.RMSNorm(

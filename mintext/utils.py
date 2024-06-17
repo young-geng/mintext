@@ -1,5 +1,6 @@
 from functools import partial
 import os
+import re
 import json
 import mlxu
 import numpy as np
@@ -172,3 +173,26 @@ def average_metrics(metrics):
         lambda *args: jnp.mean(jnp.stack(args)),
         *metrics
     )
+
+
+def match_and_transform_dict(data, rules, strict=True, donate=False):
+    """ Match keys in a dictionary to a set of rules and transform the value. """
+    transformed = {}
+    for key in list(data.keys()):
+        matched = False
+        for src_pattern, tgt_pattern, transform_fn in rules:
+            if re.match(src_pattern, key) is not None:
+                matched = True
+                target_key = re.sub(src_pattern, tgt_pattern, key)
+                if transform_fn is None:
+                    transformed[target_key] = data[key]
+                else:
+                    transformed[target_key] = transform_fn(data[key])
+
+                if donate:
+                    del data[key]
+
+                break
+        if strict and not matched:
+            raise ValueError(f"Key {key} does not match any pattern in rules")
+    return transformed
