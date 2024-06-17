@@ -17,9 +17,21 @@ from mintext.utils import match_and_transform_dict
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     hf_pretrained='',
     output_path='',
-    param_dtype='fp32',
+    param_dtype=('fp32', 'dtype to save the jax parameters in'),
+    torch_dtype=('fp16', 'dtype to load the torch parameters in'),
     llama=LLaMAConfigurator.get_default_config(),
 )
+
+
+def get_torch_dtype_by_name(dtype):
+    return {
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'fp16': torch.float16,
+        'float16': torch.float16,
+        'fp32': torch.float32,
+        'float32': torch.float32,
+    }[dtype]
 
 
 def main(argv):
@@ -46,7 +58,8 @@ def main(argv):
     )
 
     hf_weights = AutoModelForCausalLM.from_pretrained(
-        FLAGS.hf_pretrained
+        FLAGS.hf_pretrained,
+        torch_dtype=get_torch_dtype_by_name(FLAGS.torch_dtype),
     ).state_dict()
 
     def to_jnp(x):
@@ -117,6 +130,7 @@ def main(argv):
         assert key in converted_params, 'Key not found: {}'.format(key)
 
     params = flax.traverse_util.unflatten_dict(converted_params, sep='/')
+    del converted_params, hf_weights
     checkpointer = ocp.StandardCheckpointer()
     checkpointer.save(FLAGS.output_path, params)
 
