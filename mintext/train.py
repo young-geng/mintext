@@ -78,6 +78,9 @@ def main(argv):
         FLAGS.optimizer
     )
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
+
+    if FLAGS.checkpoint_path == '':
+        FLAGS.checkpoint_path = logger.output_dir
     checkpointer = Checkpointer(FLAGS.checkpoint_path)
 
     @partial(

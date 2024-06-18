@@ -132,7 +132,7 @@ def main(argv):
     params = flax.traverse_util.unflatten_dict(converted_params, sep='/')
     del converted_params, hf_weights
     checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(FLAGS.output_path, params)
+    checkpointer.save(FLAGS.output_path, params, force=True)
 
 
 if __name__ == '__main__':

@@ -6,8 +6,7 @@ command:
 tpc launch mintext_tpu_setup.py
 """
 
-launch_script = """
-#! /bin/bash
+launch_script = r"""#! /bin/bash
 
 sudo apt-get update && sudo apt-get install -y \
     build-essential \
@@ -35,7 +34,7 @@ channels:
 dependencies:
     - python=3.10
     - pip
-    - numpy
+    - numpy<2
     - scipy
     - matplotlib
     - seaborn
@@ -44,7 +43,8 @@ dependencies:
     - pytorch=2.3.0
     - cpuonly
     - pip:
-        - jax[cuda12]==0.4.28
+        - -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+        - jax[tpu]==0.4.28
         - scalax>=0.2.1
         - flax==0.8.3
         - optax==0.2.2

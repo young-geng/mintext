@@ -119,7 +119,7 @@ class JsonDataset(object):
 
     def __init__(self, config, tokenizer):
         self.config = self.get_default_config(config)
-        assert self.config.path != ''
+        assert self.config.path != '', 'JSONL data file path must be specified.'
         self._tokenizer = tokenizer
         self._text_processor = TextProcessor(self.config.text_processor, tokenizer)
         self._index = self.config.example_index_at_start
