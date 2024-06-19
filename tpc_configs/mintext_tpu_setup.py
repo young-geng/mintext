@@ -51,6 +51,7 @@ dependencies:
         - transformers==4.41.0
         - torch==2.3.0
         - orbax-checkpoint==0.5.14
+        - tensorflow-cpu==2.16.1
         - sentencepiece
         - datasets
         - tpu_pod_commander>=0.1.1

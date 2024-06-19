@@ -100,6 +100,7 @@ class Checkpointer(object):
             path = self.path
         else:
             path = os.path.join(self.path, prefix)
+
         self.checkpointer.save(path, pytree, force=True)
         # Create a commit_success.txt file to indicate that the checkpoint is
         # saved successfully. This is a workaround for orbax so that locally
@@ -117,6 +118,7 @@ class Checkpointer(object):
         if self.path == '':
             return
         path = os.path.join(self.path, name)
+        mlxu.makedirs(path)
         with mlxu.open_file(path, 'w') as f:
             f.write(json.dumps(data, indent=4))
 
