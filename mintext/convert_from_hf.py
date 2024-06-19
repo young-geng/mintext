@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ''
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
 os.environ['JAX_PLATFORMS'] = 'cpu'
 import mlxu
 import jax
@@ -133,6 +133,9 @@ def main(argv):
     del converted_params, hf_weights
     checkpointer = ocp.StandardCheckpointer()
     checkpointer.save(FLAGS.output_path, params, force=True)
+    mlxu.open_file(
+        os.path.join(FLAGS.output_path, 'commit_success.txt'), 'w'
+    ).close()
 
 
 if __name__ == '__main__':
