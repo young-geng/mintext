@@ -9,6 +9,8 @@ from multiprocessing import Pool
 import mlxu
 import numpy as np
 import einops
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error()
 
 
 class TextProcessor(object):

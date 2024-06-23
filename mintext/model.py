@@ -501,7 +501,7 @@ class LLaMAModel(nn.Module):
             param_dtype=self.param_dtype,
             name='lm_head_norm',
         )(hidden_states)
-        logits = nn.Dense(
+        logits = nn.remat(nn.Dense)(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
