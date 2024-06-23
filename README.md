@@ -1,4 +1,4 @@
-# mintext
+# MinText
 Mintext is a minimal but scalable implementation of large language models in JAX.
 Specifically, it implements the LLaMA architecture in a clean and modular way,
 which makes it easy to modify and extend. The codebase is designed to be a

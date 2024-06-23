@@ -62,16 +62,16 @@ EndOfFile
 
 
 # install dependencies
-source ~/miniconda3/bin/activate
-conda init bash
+source ~/miniforge3/bin/activate
 conda env create -f $HOME/tpu_environment.yml
 conda activate mintext
+conda clean -a -y
 """
 
 
-configure_tpc(
-    project='my-project',
-    zone='europe-west4-a',
-    name='my-tpu-name',
+configure_tpc( # type: ignore
+    project='<your GCP project>',
+    zone='<your TPC zone>',
+    name='<your TPU pod name>',
     launch_script=launch_script,
 )

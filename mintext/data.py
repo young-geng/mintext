@@ -4,7 +4,7 @@ import time
 from functools import partial
 import json
 import base64
-from multiprocessing import Pool
+import multiprocessing as mp
 
 import mlxu
 import numpy as np
@@ -170,7 +170,7 @@ class JsonDataset(object):
             for example, loc, index in self.json_iterator():
                 yield self.text_processor((example, loc, index), has_aux=True)
         else:
-            process_pool = Pool(self.config.tokenizer_processes)
+            process_pool = mp.get_context('spawn').Pool(self.config.tokenizer_processes)
             batched_iterator = self.batched(
                 self.json_iterator(), self.config.tokenizer_parallel_batch_size
             )
