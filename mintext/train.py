@@ -18,12 +18,11 @@ from mintext.utils import (
     JaxDistributedConfigurator, AdamConfigurator, Checkpointer,
     global_norm, cross_entropy_loss_and_accuracy, average_metrics,
 )
-from mintext.model import LLaMAConfigurator, LLaMAModel
+from mintext.model import LLaMAConfigurator, LLaMAShardingConfig, LLaMAModel
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
-    mesh_dim='1,-1,1',
     dtype='fp32',
     param_dtype='fp32',
     total_steps=10000,
@@ -41,6 +40,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     eval_dataset=JsonDataset.get_default_config(),
     optimizer=AdamConfigurator.get_default_config(),
     llama=LLaMAConfigurator.get_default_config(),
+    sharding=LLaMAShardingConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfigurator.get_default_config(),
@@ -67,6 +67,7 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
+    llama_sharding = LLaMAShardingConfig(FLAGS.sharding)
 
     model = LLaMAModel(
         llama_config,
@@ -77,7 +78,7 @@ def main(argv):
     optimizer, lr_schedule = AdamConfigurator.get_optimizer_and_schedule(
         FLAGS.optimizer
     )
-    mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
+    mesh = llama_sharding.get_mesh()
 
     if FLAGS.checkpoint_path == '':
         FLAGS.checkpoint_path = logger.output_dir
@@ -86,8 +87,8 @@ def main(argv):
     @partial(
         mesh.sjit,
         in_shardings=None,
-        out_shardings=LLaMAConfigurator.get_model_sharding_rule(),
-        annotation_shardings=LLaMAConfigurator.get_intermediate_sharding_rules(),
+        out_shardings=llama_sharding.get_model_sharding_rule(),
+        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
     )
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
@@ -102,21 +103,21 @@ def main(argv):
     @partial(
         mesh.sjit,
         in_shardings=(
-            LLaMAConfigurator.get_model_sharding_rule(),
+            llama_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         out_shardings=(
-            LLaMAConfigurator.get_model_sharding_rule(),
+            llama_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         args_sharding_constraint=(
-            LLaMAConfigurator.get_model_sharding_rule(),
+            llama_sharding.get_model_sharding_rule(),
             PS(),
             PS(('replica', 'fsdp')),
         ),
-        annotation_shardings=LLaMAConfigurator.get_intermediate_sharding_rules(),
+        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
         donate_argnums=(0, ),
     )
     def train_step_fn(train_state, rng, batch):
@@ -148,17 +149,17 @@ def main(argv):
     @partial(
         mesh.sjit,
         in_shardings=(
-            LLaMAConfigurator.get_model_sharding_rule(),
+            llama_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         out_shardings=(PS(), PS()),
         args_sharding_constraint=(
-            LLaMAConfigurator.get_model_sharding_rule(),
+            llama_sharding.get_model_sharding_rule(),
             PS(),
             PS(('replica', 'fsdp')),
         ),
-        annotation_shardings=LLaMAConfigurator.get_intermediate_sharding_rules(),
+        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
     )
     def eval_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)

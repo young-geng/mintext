@@ -14,7 +14,7 @@ dependencies:
     - pytorch=2.3.0
     - cpuonly
     - pip:
-        - jax[cuda12]==0.4.28
+        - jax[cuda12]==0.4.29
         - scalax>=0.2.1
         - flax==0.8.3
         - optax==0.2.2

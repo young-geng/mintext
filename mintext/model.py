@@ -189,7 +189,37 @@ class LLaMAConfigurator(object):
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
-    def get_model_sharding_rule(cls):
+    def rng_keys(cls):
+        return ('params', 'dropout')
+
+
+class LLaMAShardingConfig(object):
+    """Sharding config for llama model."""
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = mlxu.config_dict()
+        config.mesh_dim = '1,-1,1'
+        return mlxu.update_config_dict(config, updates)
+
+    def __init__(self, config):
+        self.config = self.get_default_config(config)
+
+    def get_mesh(self):
+        axis_dims = self.config.mesh_dim
+        if axis_dims.startswith('!'):
+            # Allow splitting a physical mesh axis if needed
+            mesh_axis_splitting = True
+            axis_dims = axis_dims[1:]
+        else:
+            mesh_axis_splitting = False
+
+        names = ('replica', 'fsdp', 'tensor')
+        dims = [int(x) for x in axis_dims.split(',')]
+        assert len(dims) == len(names)
+        return MeshShardingHelper(dims, names, mesh_axis_splitting)
+
+    def get_model_sharding_rule(self):
         """ Get the tree path based partition rule for LLaMA model. """
         return TreePathShardingRule(
             # embeddings
@@ -210,31 +240,12 @@ class LLaMAConfigurator(object):
             ('.*', PS(None)),
         )
 
-    @classmethod
-    def get_intermediate_sharding_rules(cls):
+    def get_intermediate_sharding_rules(self):
         return {
             'data': PS(('replica', 'fsdp')),
             'ffw_intermediate': PS(('replica', 'fsdp'), None, 'tensor'),
             'attention_kqv': PS(('replica', 'fsdp'), 'tensor', None),
         }
-
-    @classmethod
-    def get_jax_mesh(cls, axis_dims):
-        if axis_dims.startswith('!'):
-            # Allow splitting a physical mesh axis if needed
-            mesh_axis_splitting = True
-            axis_dims = axis_dims[1:]
-        else:
-            mesh_axis_splitting = False
-
-        names = ('replica', 'fsdp', 'tensor')
-        dims = [int(x) for x in axis_dims.split(',')]
-        assert len(dims) == len(names)
-        return MeshShardingHelper(dims, names, mesh_axis_splitting)
-
-    @classmethod
-    def rng_keys(cls):
-        return ('params', 'dropout')
 
 
 def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
