@@ -193,6 +193,9 @@ class JsonDataset(object):
         chunk_size = self.config.batch_size * self.config.seq_length
         token_buffer = []
         loss_mask_buffer = []
+        position_id_buffer = []
+        segment_id_buffer = []
+
         last_time = 0.0
         step_times = []
         start_time = time.time()
@@ -200,6 +203,8 @@ class JsonDataset(object):
         for tokens, loss_masks, loc, index in self.parallel_example_iterator():
             token_buffer.extend(tokens)
             loss_mask_buffer.extend(loss_masks)
+            position_id_buffer.extend(np.arange(len(tokens), dtype=np.int64).tolist())
+            segment_id_buffer.extend(np.full(len(tokens), index, dtype=np.int64).tolist())
             while len(token_buffer) > chunk_size + 1:
                 self._total_tokens += chunk_size
                 step_times.append(time.time() - last_time)
@@ -230,15 +235,19 @@ class JsonDataset(object):
                     'attention_mask': np.ones(
                         (self.config.batch_size, self.config.seq_length), dtype=np.int32
                     ),
-                    'position_ids': einops.repeat(
-                        np.arange(self.config.seq_length, dtype=np.int32),
-                        's -> b s',
-                        b=self.config.batch_size,
-                    )
+                    'position_ids': np.array(position_id_buffer[:chunk_size], dtype=np.int32).reshape(
+                        self.config.batch_size, -1
+                    ),
+                    'segment_ids': np.array(segment_id_buffer[:chunk_size], dtype=np.int32).reshape(
+                        self.config.batch_size, -1
+                    ),
                 }
+                batch['segment_ids'] = batch['segment_ids'] - np.min(batch['segment_ids'])
                 yield batch, metrics
                 token_buffer = token_buffer[chunk_size:]
                 loss_mask_buffer = loss_mask_buffer[chunk_size:]
+                position_id_buffer = position_id_buffer[chunk_size:]
+                segment_id_buffer = segment_id_buffer[chunk_size:]
 
     def get_state_dict(self):
         return dict(

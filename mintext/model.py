@@ -1,14 +1,16 @@
 from functools import partial
-from typing import Union
+from typing import Callable
 
 import numpy as np
 import mlxu
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as PS
+from jax.experimental.shard_map import shard_map
 import flax
 import flax.linen as nn
 import einops
+from ringattention import ringattention
 
 from scalax.sharding import (
     MeshShardingHelper, TreePathShardingRule, with_sharding_annotation
@@ -36,6 +38,7 @@ class LLaMAConfigurator(object):
         config.attention_dropout = mlxu.config_placeholder(float)
         config.residue_dropout = mlxu.config_placeholder(float)
         config.remat = mlxu.config_placeholder(str)
+        config.attention_chunk_size = mlxu.config_placeholder(int)
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
@@ -66,6 +69,7 @@ class LLaMAConfigurator(object):
         config.attention_dropout = 0.0
         config.residue_dropout = 0.0
         config.remat = 'block'
+        config.attention_chunk_size = 1024
 
         updates = {
             'debug': dict(
@@ -199,11 +203,13 @@ class LLaMAShardingConfig(object):
     @staticmethod
     def get_default_config(updates=None):
         config = mlxu.config_dict()
-        config.mesh_dim = '1,-1,1'
+        config.mesh_dim = '1,-1,1,1'
+        config.shard_model_along_sequence = False
         return mlxu.update_config_dict(config, updates)
 
     def __init__(self, config):
         self.config = self.get_default_config(config)
+        self._ring_attention_function = None
 
     def get_mesh(self):
         axis_dims = self.config.mesh_dim
@@ -214,38 +220,98 @@ class LLaMAShardingConfig(object):
         else:
             mesh_axis_splitting = False
 
-        names = ('replica', 'fsdp', 'tensor')
+        names = ('replica', 'fsdp', 'sequence', 'tensor')
         dims = [int(x) for x in axis_dims.split(',')]
         assert len(dims) == len(names)
         return MeshShardingHelper(dims, names, mesh_axis_splitting)
 
     def get_model_sharding_rule(self):
         """ Get the tree path based partition rule for LLaMA model. """
+        if self.config.shard_model_along_sequence:
+            model_all_gather_axis = ('fsdp', 'sequence')
+        else:
+            model_all_gather_axis = 'fsdp'
         return TreePathShardingRule(
             # embeddings
-            ('transformer/wte/embedding', PS('tensor', 'fsdp')),
+            ('transformer/wte/embedding', PS('tensor', model_all_gather_axis)),
             # atention
-            ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'tensor')),
-            ('self_attention/o_proj/kernel', PS('tensor', 'fsdp')),
+            ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS(model_all_gather_axis, 'tensor')),
+            ('self_attention/o_proj/kernel', PS('tensor', model_all_gather_axis)),
             # mlp
-            ('feedforward/up_proj/kernel', PS('fsdp', 'tensor')),
-            ('feedforward/down_proj/kernel', PS('tensor', 'fsdp')),
-            ('feedforward/gate_proj/kernel', PS('fsdp', 'tensor')),
+            ('feedforward/up_proj/kernel', PS(model_all_gather_axis, 'tensor')),
+            ('feedforward/down_proj/kernel', PS('tensor', model_all_gather_axis)),
+            ('feedforward/gate_proj/kernel', PS(model_all_gather_axis, 'tensor')),
             # layer norms
             ('input_layernorm/scale', PS(None)),
             ('post_attention_layernorm/scale', PS(None)),
             # output head
             ('lm_head_norm/scale', PS(None)),
-            ('lm_head/kernel', PS('fsdp', 'tensor')),
+            ('lm_head/kernel', PS(model_all_gather_axis, 'tensor')),
             ('.*', PS(None)),
         )
 
     def get_intermediate_sharding_rules(self):
         return {
-            'data': PS(('replica', 'fsdp')),
-            'ffw_intermediate': PS(('replica', 'fsdp'), None, 'tensor'),
-            'attention_kqv': PS(('replica', 'fsdp'), 'tensor', None),
+            'data': PS(('replica', 'fsdp'), 'sequence'),
+            'ffw_intermediate': PS(('replica', 'fsdp'), 'sequence', 'tensor'),
+            'attention_kqv': PS(('replica', 'fsdp'), 'sequence', 'tensor'),
+            'mask': PS(('replica', 'fsdp'), 'sequence'),
         }
+
+    def get_batch_sharding(self):
+        return PS(('replica', 'fsdp'), 'sequence')
+
+
+def get_ring_attention_function(
+    chunk_size,
+    deterministic=True,
+    attention_dropout=0.0,
+    dropout_rng=None,
+):
+    def vanilla_attention(xq, xk, xv, attention_bias, segment_ids):
+        attn_weights = nn.attention.dot_product_attention_weights(
+            xq,
+            xk,
+            dropout_rng=dropout_rng,
+            dropout_rate=attention_dropout,
+            deterministic=deterministic,
+            dtype=jnp.promote_types(xq.dtype, jnp.float32),
+        )
+        attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
+        return attention_output
+    if MeshShardingHelper.get_global_annotation_shardings() is None:
+        return vanilla_attention
+
+    return shard_map(
+        partial(
+            ringattention,
+            axis_name='sequence',
+            float32_logits=True,
+            cache_idx=None,
+            blockwise_kwargs=dict(
+                causal_block_size=1,
+                deterministic=deterministic,
+                dropout_rng=dropout_rng,
+                attn_pdrop=attention_dropout,
+                query_chunk_size=chunk_size,
+                key_chunk_size=chunk_size,
+                policy=jax.checkpoint_policies.nothing_saveable,
+                dtype=jnp.float32,
+                precision=None,
+                prevent_cse=True,
+            )
+        ),
+        mesh=MeshShardingHelper.get_global_mesh().mesh,
+        in_specs=(
+            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
+            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
+            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
+            PS(('replica', 'fsdp'), None, None, None),
+            PS(('replica', 'fsdp'), None),
+        ),
+        out_specs=PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
+        check_rep=False
+    )
 
 
 def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
@@ -326,7 +392,7 @@ class Attention(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask, position_ids, deterministic=True):
+    def __call__(self, hidden_states, attention_mask, position_ids, segment_ids, deterministic=True):
         assert self.config.hidden_size % self.config.num_key_value_heads == 0
         assert self.config.hidden_size % self.config.num_attention_heads == 0
 
@@ -385,34 +451,43 @@ class Attention(nn.Module):
         )
 
         # Use normal attention
-        causal_maks = nn.attention.make_causal_mask(jnp.ones((1, sequence_length)))
-        attention_mask = jnp.broadcast_to(
-            einops.rearrange(attention_mask, 'b s -> b 1 1 s'),
-            (attention_mask.shape[0], 1, sequence_length, sequence_length)
-        )
-        combined_mask = nn.attention.combine_masks(
-            causal_maks, attention_mask
-        )
-        attention_bias = jax.lax.select(
-            combined_mask > 0,
-            jnp.full(combined_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(combined_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        # causal_maks = nn.attention.make_causal_mask(jnp.ones((1, sequence_length)))
+        # attention_mask = jnp.broadcast_to(
+        #     einops.rearrange(attention_mask, 'b s -> b 1 1 s'),
+        #     (attention_mask.shape[0], 1, sequence_length, sequence_length)
+        # )
+        # combined_mask = nn.attention.combine_masks(
+        #     causal_maks, attention_mask
+        # )
+        # attention_bias = jax.lax.select(
+        #     combined_mask > 0,
+        #     jnp.full(combined_mask.shape, 0.0).astype(self.dtype),
+        #     jnp.full(combined_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+        # )
 
         dropout_rng = None
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng('dropout')
 
-        attn_weights = nn.attention.dot_product_attention_weights(
-            xq,
-            xk,
-            bias=attention_bias,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.config.attention_dropout,
+        # attn_weights = nn.attention.dot_product_attention_weights(
+        #     xq,
+        #     xk,
+        #     bias=attention_bias,
+        #     dropout_rng=dropout_rng,
+        #     dropout_rate=self.config.attention_dropout,
+        #     deterministic=deterministic,
+        #     dtype=jnp.promote_types(self.dtype, jnp.float32),
+        # )
+        # attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
+
+        attention_bias = einops.rearrange(attention_mask, 'b s -> b 1 1 s')
+        attention_output = get_ring_attention_function(
+            chunk_size=self.config.attention_chunk_size,
             deterministic=deterministic,
-            dtype=jnp.promote_types(self.dtype, jnp.float32),
-        )
-        attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
+            attention_dropout=self.config.attention_dropout,
+            dropout_rng=dropout_rng,
+        )(xq, xk, xv, attention_bias, segment_ids).astype(self.dtype)
+
         attention_output = einops.rearrange(attention_output, 'b s h d -> b s (h d)')
 
         x_out = nn.Dense(
@@ -436,7 +511,8 @@ class TransformerBlock(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask, position_ids, deterministic=True):
+    def __call__(self, hidden_states, attention_mask, position_ids,
+                 segment_ids, deterministic=True):
         x_out = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
             dtype=jnp.promote_types(self.dtype, jnp.float32),
@@ -448,7 +524,7 @@ class TransformerBlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             name='self_attention',
-        )(x_out, attention_mask, position_ids, deterministic=deterministic)
+        )(x_out, attention_mask, position_ids, segment_ids, deterministic=deterministic)
         mlp_inputs = x_out + hidden_states
         x_out = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
@@ -471,7 +547,7 @@ class LLaMAModel(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask, position_ids, deterministic=True):
+    def __call__(self, input_ids, attention_mask, position_ids, segment_ids, deterministic=True):
         hidden_states = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -495,7 +571,7 @@ class LLaMAModel(nn.Module):
         block_module = nn.remat(
             TransformerBlock,
             policy=remat_policy[self.config.remat],
-            static_argnums=(4,),
+            static_argnums=(5,),
         )
 
         for i in range(self.config.num_hidden_layers):
@@ -504,7 +580,7 @@ class LLaMAModel(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 name=f'transformer_block_{i}',
-            )(hidden_states, attention_mask, position_ids, deterministic)
+            )(hidden_states, attention_mask, position_ids, segment_ids, deterministic)
 
         hidden_states = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
