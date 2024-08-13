@@ -268,20 +268,6 @@ def get_ring_attention_function(
     attention_dropout=0.0,
     dropout_rng=None,
 ):
-    def vanilla_attention(xq, xk, xv, attention_bias, segment_ids):
-        attn_weights = nn.attention.dot_product_attention_weights(
-            xq,
-            xk,
-            dropout_rng=dropout_rng,
-            dropout_rate=attention_dropout,
-            deterministic=deterministic,
-            dtype=jnp.promote_types(xq.dtype, jnp.float32),
-        )
-        attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
-        return attention_output
-    if MeshShardingHelper.get_global_annotation_shardings() is None:
-        return vanilla_attention
-
     return shard_map(
         partial(
             ringattention,
@@ -301,7 +287,7 @@ def get_ring_attention_function(
                 prevent_cse=True,
             )
         ),
-        mesh=MeshShardingHelper.get_global_mesh().mesh,
+        mesh=MeshShardingHelper.get_global_mesh(),
         in_specs=(
             PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
             PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
