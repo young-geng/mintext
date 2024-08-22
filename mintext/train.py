@@ -96,6 +96,7 @@ def main(argv):
             input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            segment_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
@@ -115,7 +116,7 @@ def main(argv):
         args_sharding_constraint=(
             llama_sharding.get_model_sharding_rule(),
             PS(),
-            PS(('replica', 'fsdp')),
+            llama_sharding.get_batch_sharding(),
         ),
         annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
         donate_argnums=(0, ),
@@ -128,6 +129,7 @@ def main(argv):
                 input_ids=batch['input_tokens'],
                 attention_mask=batch['attention_mask'],
                 position_ids=batch['position_ids'],
+                segment_ids=batch['segment_ids'],
                 deterministic=False,
                 rngs=rng_generator(LLaMAConfigurator.rng_keys()),
             )
@@ -157,7 +159,7 @@ def main(argv):
         args_sharding_constraint=(
             llama_sharding.get_model_sharding_rule(),
             PS(),
-            PS(('replica', 'fsdp')),
+            llama_sharding.get_batch_sharding(),
         ),
         annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
     )
@@ -168,6 +170,7 @@ def main(argv):
             input_ids=batch['input_tokens'],
             attention_mask=batch['attention_masks'],
             position_ids=batch['position_ids'],
+            segment_ids=batch['segment_ids'],
             deterministic=True,
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
         )
