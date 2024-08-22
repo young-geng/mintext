@@ -4,6 +4,7 @@ from functools import partial
 from tqdm import tqdm, trange
 import numpy as np
 import mlxu
+import wandb
 
 import jax
 import jax.numpy as jnp
@@ -18,11 +19,13 @@ from mintext.utils import (
     JaxDistributedConfigurator, AdamConfigurator, Checkpointer,
     global_norm, cross_entropy_loss_and_accuracy, average_metrics,
 )
-from mintext.model import LLaMAConfigurator, LLaMAShardingConfig, LLaMAModel
+from mintext.model import LLaMAConfigurator, LLaMAModel
+from flax.training.train_state import TrainState
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
+    mesh_dim='1,-1,1,1',
     dtype='fp32',
     param_dtype='fp32',
     total_steps=10000,
@@ -33,21 +36,23 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
-    tokenizer='openlm-research/open_llama_3b_v2',
+    tokenizer='meta-llama/Meta-Llama-3-8B',
     checkpoint_path='',
     checkpoint_separate_params=True,
     train_dataset=JsonDataset.get_default_config(),
     eval_dataset=JsonDataset.get_default_config(),
     optimizer=AdamConfigurator.get_default_config(),
     llama=LLaMAConfigurator.get_default_config(),
-    sharding=LLaMAShardingConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfigurator.get_default_config(),
+    jax_compilation_cache_dir='',
 )
 
 
 def main(argv):
+    if FLAGS.jax_compilation_cache_dir != '':
+        jax.config.update("jax_compilation_cache_dir", FLAGS.jax_compilation_cache_dir)
     JaxDistributedConfigurator.initialize(FLAGS.jax_distributed)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
@@ -67,7 +72,6 @@ def main(argv):
 
     seq_length = dataset.seq_length
     llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    llama_sharding = LLaMAShardingConfig(FLAGS.sharding)
 
     model = LLaMAModel(
         llama_config,
@@ -78,47 +82,29 @@ def main(argv):
     optimizer, lr_schedule = AdamConfigurator.get_optimizer_and_schedule(
         FLAGS.optimizer
     )
-    mesh = llama_sharding.get_mesh()
+    mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
 
     if FLAGS.checkpoint_path == '':
         FLAGS.checkpoint_path = logger.output_dir
     checkpointer = Checkpointer(FLAGS.checkpoint_path)
 
-    @partial(
-        mesh.sjit,
-        in_shardings=None,
-        out_shardings=llama_sharding.get_model_sharding_rule(),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
-    )
+    model_sharding_rule = LLaMAConfigurator.get_model_sharding_rule(llama_config.scan_layers)
+
+    @partial(mesh.sjit, in_shardings=None, out_shardings=model_sharding_rule)
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
+        batch = 512
         params = model.init(
-            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
-            segment_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((batch, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((batch, seq_length), dtype=jnp.int32),
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
-    @partial(
-        mesh.sjit,
-        in_shardings=(
-            llama_sharding.get_model_sharding_rule(),
-            PS(),
-            PS(),
-        ),
-        out_shardings=(
-            llama_sharding.get_model_sharding_rule(),
-            PS(),
-            PS(),
-        ),
-        args_sharding_constraint=(
-            llama_sharding.get_model_sharding_rule(),
-            PS(),
-            llama_sharding.get_batch_sharding(),
-        ),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
+    @partial(mesh.sjit,
+        in_shardings=(model_sharding_rule, PS(), PS()),
+        out_shardings=(model_sharding_rule, PS(), PS()),
+        args_sharding_constraint=(model_sharding_rule, PS(), PS(('dp', 'fsdp'), 'sp')),
         donate_argnums=(0, ),
     )
     def train_step_fn(train_state, rng, batch):
@@ -129,7 +115,6 @@ def main(argv):
                 input_ids=batch['input_tokens'],
                 attention_mask=batch['attention_mask'],
                 position_ids=batch['position_ids'],
-                segment_ids=batch['segment_ids'],
                 deterministic=False,
                 rngs=rng_generator(LLaMAConfigurator.rng_keys()),
             )
@@ -150,32 +135,22 @@ def main(argv):
 
     @partial(
         mesh.sjit,
-        in_shardings=(
-            llama_sharding.get_model_sharding_rule(),
-            PS(),
-            PS(),
-        ),
+        in_shardings=(model_sharding_rule, PS(), PS()),
         out_shardings=(PS(), PS()),
-        args_sharding_constraint=(
-            llama_sharding.get_model_sharding_rule(),
-            PS(),
-            llama_sharding.get_batch_sharding(),
-        ),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
+        args_sharding_constraint=(model_sharding_rule, PS(), PS(('dp', 'fsdp'), 'sp')),
     )
     def eval_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         logits = model.apply(
             train_state.params,
             input_ids=batch['input_tokens'],
-            attention_mask=batch['attention_masks'],
+            attention_mask=batch['attention_mask'],
             position_ids=batch['position_ids'],
-            segment_ids=batch['segment_ids'],
             deterministic=True,
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
         )
         loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits,batch['target_tokens'], batch['loss_masks']
+            logits, batch['target_tokens'], batch['loss_masks']
         )
         metrics = dict(
             eval_loss=loss,
@@ -248,7 +223,9 @@ def main(argv):
                         train_state, sharded_rng, eval_batch
                     )
                     eval_metric_list.append(eval_metrics)
-                metrics.update(average_metrics(eval_metric_list))
+                eval_metrics = average_metrics(eval_metric_list)
+                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                metrics.update(eval_metrics)
 
             log_metrics = {"step": step}
             log_metrics.update(metrics)

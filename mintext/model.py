@@ -1,19 +1,21 @@
+from typing import Any, Dict, List, Optional, Tuple, Union
+import json
 from functools import partial
-from typing import Callable
+import einops
 
 import numpy as np
-import mlxu
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.sharding import PartitionSpec as PS
 from jax.experimental.shard_map import shard_map
 import flax
 import flax.linen as nn
-import einops
-from ringattention import ringattention
-
+from flax.linen import partitioning as nn_partitioning
+from ringattention import blockwise_feedforward, ringattention, ringattention_inference
+import mlxu
 from scalax.sharding import (
-    MeshShardingHelper, TreePathShardingRule, with_sharding_annotation
+    MeshShardingHelper, TreePathShardingRule, with_sharding_annotation, with_sharding_constraint
 )
 
 
@@ -31,19 +33,21 @@ class LLaMAConfigurator(object):
         config.num_key_value_heads = mlxu.config_placeholder(int)
         config.initializer_range = mlxu.config_placeholder(float)
         config.rms_norm_eps = mlxu.config_placeholder(float)
-        config.max_position_embeddings = mlxu.config_placeholder(int)
+        config.seq_length = mlxu.config_placeholder(int)
         config.rope_theta = mlxu.config_placeholder(float)
         config.embedding_dropout = mlxu.config_placeholder(float)
         config.feedforward_dropout = mlxu.config_placeholder(float)
         config.attention_dropout = mlxu.config_placeholder(float)
         config.residue_dropout = mlxu.config_placeholder(float)
-        config.remat = mlxu.config_placeholder(str)
-        config.attention_chunk_size = mlxu.config_placeholder(int)
+        config.scan_attention = mlxu.config_placeholder(bool)
+        config.scan_mlp = mlxu.config_placeholder(bool)
+        config.scan_layers = mlxu.config_placeholder(bool)
+        config.scan_query_chunk_size = mlxu.config_placeholder(int)
+        config.scan_key_chunk_size = mlxu.config_placeholder(int)
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
     def finalize_config(cls, config):
-        """ Apply updates on top of standard base model config. """
         standard_config = cls.get_standard_llama_config(config.base_model)
         for key, value in config.items():
             if key != 'base_model' and value is not None:
@@ -62,15 +66,17 @@ class LLaMAConfigurator(object):
         config.num_key_value_heads = 32
         config.initializer_range = 1.0
         config.rms_norm_eps = 1e-6
-        config.max_position_embeddings = 2048
+        config.seq_length = 2048
         config.rope_theta = 1e4
         config.embedding_dropout = 0.0
         config.feedforward_dropout = 0.0
         config.attention_dropout = 0.0
         config.residue_dropout = 0.0
-        config.remat = 'block'
-        config.attention_chunk_size = 1024
-
+        config.scan_mlp = False
+        config.scan_attention = True
+        config.scan_query_chunk_size = 512
+        config.scan_key_chunk_size = 512
+        config.scan_layers = True
         updates = {
             'debug': dict(
                 base_model='debug',
@@ -79,6 +85,15 @@ class LLaMAConfigurator(object):
                 num_hidden_layers=2,
                 num_attention_heads=4,
                 num_key_value_heads=4,
+                rms_norm_eps=1e-6,
+            ),
+            'llama_0.2b': dict(
+                base_model='llama_0.2b',
+                hidden_size=1024,
+                intermediate_size=2560,
+                num_hidden_layers=22,
+                num_attention_heads=16,
+                num_key_value_heads=16,
                 rms_norm_eps=1e-6,
             ),
             'llama_1b': dict(
@@ -142,7 +157,6 @@ class LLaMAConfigurator(object):
                 num_hidden_layers=32,
                 num_attention_heads=32,
                 num_key_value_heads=32,
-                max_position_embeddings=4096,
                 rms_norm_eps=1e-5,
             ),
             'llama2_13b': dict(
@@ -152,7 +166,6 @@ class LLaMAConfigurator(object):
                 num_hidden_layers=40,
                 num_attention_heads=40,
                 num_key_value_heads=40,
-                max_position_embeddings=4096,
                 rms_norm_eps=1e-5,
             ),
             'llama2_70b': dict(
@@ -162,30 +175,25 @@ class LLaMAConfigurator(object):
                 num_hidden_layers=80,
                 num_attention_heads=64,
                 num_key_value_heads=8,
-                max_position_embeddings=4096,
                 rms_norm_eps=1e-5,
             ),
             'llama3_8b': dict(
                 base_model='llama3_8b',
-                vocab_size=128256,
                 hidden_size=4096,
                 intermediate_size=14336,
                 num_hidden_layers=32,
                 num_attention_heads=32,
                 num_key_value_heads=8,
-                max_position_embeddings=8192,
                 rms_norm_eps=1e-5,
                 rope_theta=5e5,
             ),
             'llama3_70b': dict(
                 base_model='llama3_8b',
-                vocab_size=128256,
                 hidden_size=8192,
                 intermediate_size=28672,
                 num_hidden_layers=80,
                 num_attention_heads=64,
                 num_key_value_heads=8,
-                max_position_embeddings=8192,
                 rms_norm_eps=1e-5,
                 rope_theta=5e5,
             ),
@@ -193,26 +201,48 @@ class LLaMAConfigurator(object):
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
-    def rng_keys(cls):
-        return ('params', 'dropout')
+    def get_model_sharding_rule(cls, scan_layers=False):
+        if not scan_layers:
+            return TreePathShardingRule(
+                # embeddings
+                ('transformer/wte/embedding', PS('tp', 'fsdp')),
+                # atention
+                ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS('fsdp', 'tp')),
+                ('self_attention/o_proj/kernel', PS('tp', 'fsdp')),
+                # mlp
+                ('feedforward/up_proj/kernel', PS('fsdp', 'tp')),
+                ('feedforward/down_proj/kernel', PS('tp', 'fsdp')),
+                ('feedforward/gate_proj/kernel', PS('fsdp', 'tp')),
+                # layer norms
+                ('input_layernorm/scale', PS(None)),
+                ('post_attention_layernorm/scale', PS(None)),
+                # output head
+                ('lm_head_norm/scale', PS(None)),
+                ('lm_head/kernel', PS('fsdp', 'tp')),
+                ('.*', PS(None)),
+            )
+        else:
+            return TreePathShardingRule(
+                # embeddings
+                ('transformer/wte/embedding', PS('tp', 'fsdp')),
+                # atention
+                ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS(None, 'fsdp', 'tp')),
+                ('self_attention/o_proj/kernel', PS(None, 'tp', 'fsdp')),
+                # mlp
+                ('feedforward/up_proj/kernel', PS(None, 'fsdp', 'tp')),
+                ('feedforward/down_proj/kernel', PS(None, 'tp', 'fsdp')),
+                ('feedforward/gate_proj/kernel', PS(None, 'fsdp', 'tp')),
+                # layer norms
+                ('input_layernorm/scale', PS(None, None)),
+                ('post_attention_layernorm/scale', PS(None, None)),
+                # output head
+                ('lm_head_norm/scale', PS(None)),
+                ('lm_head/kernel', PS('fsdp', 'tp')),
+                ('.*', PS(None)),
+            )
 
-
-class LLaMAShardingConfig(object):
-    """Sharding config for llama model."""
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = mlxu.config_dict()
-        config.mesh_dim = '1,-1,1,1'
-        config.shard_model_along_sequence = False
-        return mlxu.update_config_dict(config, updates)
-
-    def __init__(self, config):
-        self.config = self.get_default_config(config)
-        self._ring_attention_function = None
-
-    def get_mesh(self):
-        axis_dims = self.config.mesh_dim
+    @classmethod
+    def get_jax_mesh(cls, axis_dims):
         if axis_dims.startswith('!'):
             # Allow splitting a physical mesh axis if needed
             mesh_axis_splitting = True
@@ -220,84 +250,14 @@ class LLaMAShardingConfig(object):
         else:
             mesh_axis_splitting = False
 
-        names = ('replica', 'fsdp', 'sequence', 'tensor')
+        names = ('dp', 'fsdp', 'tp', 'sp')
         dims = [int(x) for x in axis_dims.split(',')]
         assert len(dims) == len(names)
         return MeshShardingHelper(dims, names, mesh_axis_splitting)
 
-    def get_model_sharding_rule(self):
-        """ Get the tree path based partition rule for LLaMA model. """
-        if self.config.shard_model_along_sequence:
-            model_all_gather_axis = ('fsdp', 'sequence')
-        else:
-            model_all_gather_axis = 'fsdp'
-        return TreePathShardingRule(
-            # embeddings
-            ('transformer/wte/embedding', PS('tensor', model_all_gather_axis)),
-            # atention
-            ('self_attention/(k_proj|q_proj|v_proj)/kernel', PS(model_all_gather_axis, 'tensor')),
-            ('self_attention/o_proj/kernel', PS('tensor', model_all_gather_axis)),
-            # mlp
-            ('feedforward/up_proj/kernel', PS(model_all_gather_axis, 'tensor')),
-            ('feedforward/down_proj/kernel', PS('tensor', model_all_gather_axis)),
-            ('feedforward/gate_proj/kernel', PS(model_all_gather_axis, 'tensor')),
-            # layer norms
-            ('input_layernorm/scale', PS(None)),
-            ('post_attention_layernorm/scale', PS(None)),
-            # output head
-            ('lm_head_norm/scale', PS(None)),
-            ('lm_head/kernel', PS(model_all_gather_axis, 'tensor')),
-            ('.*', PS(None)),
-        )
-
-    def get_intermediate_sharding_rules(self):
-        return {
-            'data': PS(('replica', 'fsdp'), 'sequence'),
-            'ffw_intermediate': PS(('replica', 'fsdp'), 'sequence', 'tensor'),
-            'attention_kqv': PS(('replica', 'fsdp'), 'sequence', 'tensor'),
-            'mask': PS(('replica', 'fsdp'), 'sequence'),
-        }
-
-    def get_batch_sharding(self):
-        return PS(('replica', 'fsdp'), 'sequence')
-
-
-def get_ring_attention_function(
-    chunk_size,
-    deterministic=True,
-    attention_dropout=0.0,
-    dropout_rng=None,
-):
-    return shard_map(
-        partial(
-            ringattention,
-            axis_name='sequence',
-            float32_logits=True,
-            cache_idx=None,
-            blockwise_kwargs=dict(
-                causal_block_size=1,
-                deterministic=deterministic,
-                dropout_rng=dropout_rng,
-                attn_pdrop=attention_dropout,
-                query_chunk_size=chunk_size,
-                key_chunk_size=chunk_size,
-                policy=jax.checkpoint_policies.nothing_saveable,
-                dtype=jnp.float32,
-                precision=None,
-                prevent_cse=True,
-            )
-        ),
-        mesh=MeshShardingHelper.get_global_mesh(),
-        in_specs=(
-            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
-            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
-            PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
-            PS(('replica', 'fsdp'), None, None, None),
-            PS(('replica', 'fsdp'), None),
-        ),
-        out_specs=PS(('replica', 'fsdp'), 'sequence', 'tensor', None),
-        check_rep=False
-    )
+    @classmethod
+    def rng_keys(cls):
+        return ('params', 'dropout')
 
 
 def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
@@ -312,10 +272,8 @@ def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
     freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
-
     xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
-    # add head dim
     freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
     xq_out = xq_ * freqs_cis
     xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
@@ -377,12 +335,63 @@ class Attention(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
+    def _concatenate_to_cache(self, key, value, query):
+        is_initialized = self.has_variable("cache", "cached_key")
+        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+
+        if is_initialized:
+            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+            # update key, value caches with our new 1d spatial slices
+            cur_index = cache_index.value
+            if query.shape[1] == 1:
+                mesh = MeshShardingHelper.get_global_mesh()
+                def fn(cached_key, cached_value, key, value, cur_index):
+                    assert key.shape[1] == 1 and value.shape[1] == 1, (key.shape, value.shape)
+                    sp_size = max_length // mesh.shape['sp']
+                    axis_index = jax.lax.axis_index('sp')
+                    cur_index = cur_index - axis_index * sp_size
+                    key, value = jax.lax.cond(
+                        jnp.logical_and(cur_index >= 0, cur_index < sp_size),
+                        lambda: (
+                            cached_key.at[:, cur_index].set(key[:, -1]),
+                            cached_value.at[:, cur_index].set(value[:, -1]),
+                        ),
+                        lambda: (cached_key, cached_value),
+                    )
+                    return key, value
+                fn = shard_map(
+                    fn, mesh=mesh,
+                    in_specs=(
+                        PS(('dp', 'fsdp'), 'sp', 'tp', None),
+                        PS(('dp', 'fsdp'), 'sp', 'tp', None),
+                        PS(('dp', 'fsdp'), None, 'tp', None),
+                        PS(('dp', 'fsdp'), None, 'tp', None),
+                        PS()
+                    ),
+                    out_specs=(
+                        PS(('dp', 'fsdp'), 'sp', 'tp', None),
+                        PS(('dp', 'fsdp'), 'sp', 'tp', None)
+                    ),
+                    check_rep=False
+                )
+                key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+            else:
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)
+            cached_key.value = key
+            cached_value.value = value
+            num_updated_cache_vectors = query.shape[1]
+            cache_index.value = cache_index.value + num_updated_cache_vectors
+        return key, value
+
     @nn.compact
-    def __call__(self, hidden_states, attention_mask, position_ids, segment_ids, deterministic=True):
+    def __call__(self, hidden_states, attention_mask, segment_ids, position_ids, deterministic, init_cache):
         assert self.config.hidden_size % self.config.num_key_value_heads == 0
         assert self.config.hidden_size % self.config.num_attention_heads == 0
 
-        sequence_length = hidden_states.shape[1]
         init_scale = self.config.initializer_range / np.sqrt(self.config.hidden_size)
         num_query_groups = self.config.num_attention_heads // self.config.num_key_value_heads
 
@@ -411,6 +420,13 @@ class Attention(nn.Module):
             name='v_proj',
         )(hidden_states)
 
+        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), "sp", "tp"))
+        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), "sp", "tp"))
+        if xq.shape[1] == 1:
+            xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "tp"))
+        else:
+            xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), "sp", "tp"))
+
         xq = einops.rearrange(
             xq, 'b s (h d) -> b s h d',
             h=self.config.num_attention_heads,
@@ -426,53 +442,102 @@ class Attention(nn.Module):
             g=num_query_groups,
         )
 
-        xq = with_sharding_annotation(xq, 'attention_kqv')
-        xk = with_sharding_annotation(xk, 'attention_kqv')
-        xv = with_sharding_annotation(xv, 'attention_kqv')
-
+        if position_ids is None:
+            position_ids = jnp.arange(0, self.config.seq_length, dtype=jnp.int32)[None].repeat(hidden_states.shape[0], axis=0)
         xq, xk = apply_rotary_emb(
             xq, xk, position_ids,
-            max_pos=self.config.max_position_embeddings,
+            max_pos=self.config.seq_length,
             theta=self.config.rope_theta,
         )
 
-        # Use normal attention
-        # causal_maks = nn.attention.make_causal_mask(jnp.ones((1, sequence_length)))
-        # attention_mask = jnp.broadcast_to(
-        #     einops.rearrange(attention_mask, 'b s -> b 1 1 s'),
-        #     (attention_mask.shape[0], 1, sequence_length, sequence_length)
-        # )
-        # combined_mask = nn.attention.combine_masks(
-        #     causal_maks, attention_mask
-        # )
-        # attention_bias = jax.lax.select(
-        #     combined_mask > 0,
-        #     jnp.full(combined_mask.shape, 0.0).astype(self.dtype),
-        #     jnp.full(combined_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        # )
+        if self.config.scan_attention and xq.shape[1] > max(self.config.scan_query_chunk_size, self.config.scan_key_chunk_size):
+            if self.has_variable("cache", "cached_key") or init_cache:
+                xk, xv = self._concatenate_to_cache(xk, xv, xq)
 
-        dropout_rng = None
-        if not deterministic and self.config.attention_dropout > 0.0:
-            dropout_rng = self.make_rng('dropout')
+            if attention_mask is not None:
+                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+            else:
+                attention_bias = None
+            ring_attention_sharded = shard_map(
+                partial(
+                    ringattention,
+                    axis_name="sp",
+                    float32_logits=True,
+                    cache_idx=None,
+                    blockwise_kwargs=dict(
+                        causal_block_size=1,
+                        deterministic=deterministic,
+                        dropout_rng=None,
+                        attn_pdrop=0,
+                        query_chunk_size=self.config.scan_query_chunk_size,
+                        key_chunk_size=self.config.scan_key_chunk_size,
+                        dtype=self.dtype,
+                        policy=jax.checkpoint_policies.nothing_saveable,
+                        precision=None,
+                        prevent_cse=not self.config.scan_layers,
+                    )
+                ),
+                mesh=MeshShardingHelper.get_global_mesh(),
+                in_specs=(
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), None, None, None),
+                    PS(("dp", "fsdp"), None),
+                ),
+                out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
+                check_rep=False
+            )
+            attention_output = ring_attention_sharded(xq, xk, xv, attention_bias, segment_ids)
+            attention_output = with_sharding_constraint(attention_output, PS(("dp", "fsdp"), "sp", "tp", None))
+        else:
+            query_length, key_length = xq.shape[1], xk.shape[1]
 
-        # attn_weights = nn.attention.dot_product_attention_weights(
-        #     xq,
-        #     xk,
-        #     bias=attention_bias,
-        #     dropout_rng=dropout_rng,
-        #     dropout_rate=self.config.attention_dropout,
-        #     deterministic=deterministic,
-        #     dtype=jnp.promote_types(self.dtype, jnp.float32),
-        # )
-        # attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
+            if self.has_variable("cache", "cached_key"):
+                mask_shift = self.variables["cache"]["cache_index"]
+                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+                causal_mask = jnp.arange(max_decoder_length)[None] <= (jnp.arange(query_length) + mask_shift)[:, None]
+                causal_mask = causal_mask[None, None]
+                segment_mask = None
+            else:
+                causal_mask = nn.attention.make_causal_mask(jnp.ones((1, self.config.seq_length), dtype="bool"), dtype="bool")
+                causal_mask = causal_mask[:, :, :query_length, :key_length]
+                if segment_ids is not None:
+                    segment_mask = segment_ids[:, :, None] == segment_ids[:, None, :]
+                    segment_mask = segment_mask[:, None]
+                else:
+                    segment_mask = None
 
-        attention_bias = einops.rearrange(attention_mask, 'b s -> b 1 1 s')
-        attention_output = get_ring_attention_function(
-            chunk_size=self.config.attention_chunk_size,
-            deterministic=deterministic,
-            attention_dropout=self.config.attention_dropout,
-            dropout_rng=dropout_rng,
-        )(xq, xk, xv, attention_bias, segment_ids).astype(self.dtype)
+            batch_size = hidden_states.shape[0]
+            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+
+            if attention_mask is not None:
+                attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = nn.attention.combine_masks(attention_mask, causal_mask, segment_mask)
+
+            if self.has_variable("cache", "cached_key") or init_cache:
+                xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
+
+            q_sp_dim = None if xq.shape[1] == 1 else 'sp'
+            ring_attention_sharded = shard_map(
+                partial(ringattention_inference, axis_name="sp"), mesh=MeshShardingHelper.get_global_mesh(),
+                in_specs=(
+                    PS(("dp", "fsdp"), q_sp_dim, "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), "sp", "tp", None),
+                    PS(("dp", "fsdp"), None, q_sp_dim, None)
+                ),
+                out_specs=PS(("dp", "fsdp"), q_sp_dim, "tp", None),
+                check_rep=False
+            )
+            attention_output = ring_attention_sharded(
+                xq, xk, xv, attention_mask
+            )
 
         attention_output = einops.rearrange(attention_output, 'b s h d -> b s (h d)')
 
@@ -497,8 +562,7 @@ class TransformerBlock(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask, position_ids,
-                 segment_ids, deterministic=True):
+    def __call__(self, hidden_states, attention_mask, segment_ids, position_ids, deterministic, init_cache):
         x_out = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
             dtype=jnp.promote_types(self.dtype, jnp.float32),
@@ -510,7 +574,7 @@ class TransformerBlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             name='self_attention',
-        )(x_out, attention_mask, position_ids, segment_ids, deterministic=deterministic)
+        )(x_out, attention_mask, segment_ids, position_ids, deterministic, init_cache)
         mlp_inputs = x_out + hidden_states
         x_out = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
@@ -518,13 +582,29 @@ class TransformerBlock(nn.Module):
             param_dtype=self.param_dtype,
             name='post_attention_layernorm',
         )(mlp_inputs)
-        x_out = FeedForward(
+        if self.config.scan_mlp:
+            feed_forward_module = nn.partitioning.remat(
+                FeedForward, static_argnums=(1,),
+                policy=jax.checkpoint_policies.nothing_saveable,
+                prevent_cse=not self.config.scan_layers,
+            )
+        else:
+            feed_forward_module = FeedForward
+        feed_forward = feed_forward_module(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             name='feedforward',
-        )(x_out, deterministic=deterministic)
-        return x_out + mlp_inputs
+        )
+        if self.config.scan_mlp and hidden_states.shape[1] >= self.config.scan_mlp_chunk_size:
+            x_out = blockwise_feedforward(feed_forward, x_out, self.config.scan_mlp_chunk_size, pre_remat=True)
+        else:
+            x_out = feed_forward(x_out, deterministic)
+        x_out = with_sharding_constraint(x_out, PS(("dp", "fsdp"), None, "tp"))
+        outputs = x_out + mlp_inputs
+        if self.config.scan_layers:
+            return (outputs, None)
+        return outputs
 
 
 class LLaMAModel(nn.Module):
@@ -533,7 +613,7 @@ class LLaMAModel(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask, position_ids, segment_ids, deterministic=True):
+    def __call__(self, input_ids, attention_mask=None, segment_ids=None, position_ids=None, deterministic=True, init_cache=False):
         hidden_states = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -548,33 +628,59 @@ class LLaMAModel(nn.Module):
             rate=self.config.embedding_dropout, name='emb_drop'
         )(hidden_states, deterministic=deterministic)
 
-        remat_policy = {
-            'block': jax.checkpoint_policies.nothing_saveable,
-            'dots': jax.checkpoint_policies.checkpoint_dots,
-            'dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-            'none': jax.checkpoint_policies.everything_saveable,
-        }
-        block_module = nn.remat(
-            TransformerBlock,
-            policy=remat_policy[self.config.remat],
-            static_argnums=(5,),
-        )
-
-        for i in range(self.config.num_hidden_layers):
-            hidden_states = block_module(
-                self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                name=f'transformer_block_{i}',
-            )(hidden_states, attention_mask, position_ids, segment_ids, deterministic)
-
+        if self.config.scan_layers:
+            initializing = self.is_mutable_collection('params')
+            params_spec = (
+                0 if initializing else
+                nn_partitioning.ScanIn(0))
+            cache_spec = 0
+            hidden_states, _ = nn.scan(
+                TransformerBlock,
+                variable_axes={
+                    'params': params_spec,
+                    'cache': cache_spec,
+                    'intermediates': 0
+                },
+                split_rngs={
+                    'params': True,
+                    'dropout': True
+                },
+                in_axes=(nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+                length=self.config.num_hidden_layers,
+                metadata_params={nn.PARTITION_NAME: 'scan_decoder_layer'},
+                )(self.config, name='scan_decoder', dtype=self.dtype, param_dtype=self.param_dtype)(
+                    hidden_states,
+                    attention_mask,
+                    segment_ids,
+                    position_ids,
+                    deterministic,
+                    init_cache,
+                )
+        else:
+            blocks = [
+                TransformerBlock(
+                    self.config,
+                    name=f'transformer_block_{i}',
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                ) for i in range(self.config.num_hidden_layers)
+            ]
+            for block in blocks:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask,
+                    segment_ids,
+                    position_ids,
+                    deterministic,
+                    init_cache,
+                )
         hidden_states = nn.RMSNorm(
             epsilon=self.config.rms_norm_eps,
             dtype=jnp.float32,
             param_dtype=self.param_dtype,
             name='lm_head_norm',
         )(hidden_states)
-        logits = nn.remat(nn.Dense)(
+        logits = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

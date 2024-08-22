@@ -5,6 +5,7 @@ from functools import partial
 import json
 import base64
 import multiprocessing as mp
+from multiprocessing import Pool
 
 import mlxu
 import numpy as np
@@ -117,6 +118,7 @@ class JsonDataset(object):
         config.tokenizer_parallel_chunk_size = 32
         config.tokenizer_parallel_batch_size = 1024
         config.throughput_average_window_size = 200
+        config.pad = False
         return mlxu.update_config_dict(config, updates)
 
     def __init__(self, config, tokenizer):
@@ -170,7 +172,7 @@ class JsonDataset(object):
             for example, loc, index in self.json_iterator():
                 yield self.text_processor((example, loc, index), has_aux=True)
         else:
-            process_pool = mp.get_context('spawn').Pool(self.config.tokenizer_processes)
+            process_pool = Pool(self.config.tokenizer_processes)
             batched_iterator = self.batched(
                 self.json_iterator(), self.config.tokenizer_parallel_batch_size
             )
@@ -193,18 +195,19 @@ class JsonDataset(object):
         chunk_size = self.config.batch_size * self.config.seq_length
         token_buffer = []
         loss_mask_buffer = []
-        position_id_buffer = []
-        segment_id_buffer = []
-
         last_time = 0.0
         step_times = []
         start_time = time.time()
         start_tokens = self._total_tokens
         for tokens, loss_masks, loc, index in self.parallel_example_iterator():
+            if self.config.pad:
+                tokens = tokens[:self.config.seq_length + 1]
+                tmp_token = self._tokenizer.bos_token_id
+                tokens.extend([tmp_token] * (self.config.seq_length + 1 - len(tokens)))
+                loss_masks = loss_masks[:self.config.seq_length + 1]
+                loss_masks.extend([0.0] * (self.config.seq_length + 1 - len(loss_masks)))
             token_buffer.extend(tokens)
             loss_mask_buffer.extend(loss_masks)
-            position_id_buffer.extend(np.arange(len(tokens), dtype=np.int64).tolist())
-            segment_id_buffer.extend(np.full(len(tokens), index, dtype=np.int64).tolist())
             while len(token_buffer) > chunk_size + 1:
                 self._total_tokens += chunk_size
                 step_times.append(time.time() - last_time)
@@ -235,19 +238,18 @@ class JsonDataset(object):
                     'attention_mask': np.ones(
                         (self.config.batch_size, self.config.seq_length), dtype=np.int32
                     ),
-                    'position_ids': np.array(position_id_buffer[:chunk_size], dtype=np.int32).reshape(
-                        self.config.batch_size, -1
-                    ),
-                    'segment_ids': np.array(segment_id_buffer[:chunk_size], dtype=np.int32).reshape(
-                        self.config.batch_size, -1
-                    ),
+                    'position_ids': einops.repeat(
+                        np.arange(self.config.seq_length, dtype=np.int32),
+                        's -> b s',
+                        b=self.config.batch_size,
+                    )
                 }
-                batch['segment_ids'] = batch['segment_ids'] - np.min(batch['segment_ids'])
                 yield batch, metrics
-                token_buffer = token_buffer[chunk_size:]
-                loss_mask_buffer = loss_mask_buffer[chunk_size:]
-                position_id_buffer = position_id_buffer[chunk_size:]
-                segment_id_buffer = segment_id_buffer[chunk_size:]
+                if self.config.pad:
+                    token_buffer, loss_mask_buffer = [], []
+                else:
+                    token_buffer = token_buffer[chunk_size:]
+                    loss_mask_buffer = loss_mask_buffer[chunk_size:]
 
     def get_state_dict(self):
         return dict(
