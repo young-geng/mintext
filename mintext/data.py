@@ -203,8 +203,10 @@ class JsonDataset(object):
         for tokens, loss_masks, loc, index in self.parallel_example_iterator():
             token_buffer.extend(tokens)
             loss_mask_buffer.extend(loss_masks)
-            position_id_buffer.extend(np.arange(len(tokens), dtype=np.int64).tolist())
-            segment_id_buffer.extend(np.full(len(tokens), index, dtype=np.int64).tolist())
+            position_id_buffer.extend(
+                (np.arange(len(tokens), dtype=np.int32) % self.config.seq_length).tolist()
+            )
+            segment_id_buffer.extend(np.full(len(tokens), index, dtype=np.int32).tolist())
             while len(token_buffer) > chunk_size + 1:
                 self._total_tokens += chunk_size
                 step_times.append(time.time() - last_time)

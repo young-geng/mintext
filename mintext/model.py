@@ -436,35 +436,9 @@ class Attention(nn.Module):
             theta=self.config.rope_theta,
         )
 
-        # Use normal attention
-        # causal_maks = nn.attention.make_causal_mask(jnp.ones((1, sequence_length)))
-        # attention_mask = jnp.broadcast_to(
-        #     einops.rearrange(attention_mask, 'b s -> b 1 1 s'),
-        #     (attention_mask.shape[0], 1, sequence_length, sequence_length)
-        # )
-        # combined_mask = nn.attention.combine_masks(
-        #     causal_maks, attention_mask
-        # )
-        # attention_bias = jax.lax.select(
-        #     combined_mask > 0,
-        #     jnp.full(combined_mask.shape, 0.0).astype(self.dtype),
-        #     jnp.full(combined_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        # )
-
         dropout_rng = None
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng('dropout')
-
-        # attn_weights = nn.attention.dot_product_attention_weights(
-        #     xq,
-        #     xk,
-        #     bias=attention_bias,
-        #     dropout_rng=dropout_rng,
-        #     dropout_rate=self.config.attention_dropout,
-        #     deterministic=deterministic,
-        #     dtype=jnp.promote_types(self.dtype, jnp.float32),
-        # )
-        # attention_output = jnp.einsum('...hqk,...khd->...qhd', attn_weights, xv)
 
         attention_bias = einops.rearrange(attention_mask, 'b s -> b 1 1 s')
         attention_output = get_ring_attention_function(
