@@ -7,7 +7,6 @@ import mlxu
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from scalax.utils import JaxRNG, get_float_dtype_by_name
 from flax.training.train_state import TrainState
@@ -18,7 +17,8 @@ from mintext.utils import (
     JaxDistributedConfigurator, AdamConfigurator, Checkpointer,
     global_norm, cross_entropy_loss_and_accuracy, average_metrics,
 )
-from mintext.model import LLaMAConfigurator, LLaMAShardingConfig, LLaMAModel
+from mintext.model import LLaMAShardingConfig, LLaMAModel
+from mintext.llama_configs import LLaMAConfigurator
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
@@ -97,7 +97,7 @@ def main(argv):
             position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
             segment_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+            rngs=rng_generator(LLaMAModel.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
@@ -131,7 +131,7 @@ def main(argv):
                 position_ids=batch['position_ids'],
                 segment_ids=batch['segment_ids'],
                 deterministic=False,
-                rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                rngs=rng_generator(LLaMAModel.rng_keys()),
             )
             return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks']
@@ -172,7 +172,7 @@ def main(argv):
             position_ids=batch['position_ids'],
             segment_ids=batch['segment_ids'],
             deterministic=True,
-            rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+            rngs=rng_generator(LLaMAModel.rng_keys()),
         )
         loss, accuracy = cross_entropy_loss_and_accuracy(
             logits,batch['target_tokens'], batch['loss_masks']
