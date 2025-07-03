@@ -117,11 +117,13 @@ class JsonDataset(object):
         config.tokenizer_parallel_chunk_size = 32
         config.tokenizer_parallel_batch_size = 1024
         config.throughput_average_window_size = 200
+        config.debug_json_data = ''
         return mlxu.update_config_dict(config, updates)
 
     def __init__(self, config, tokenizer):
         self.config = self.get_default_config(config)
-        assert self.config.path != '', 'JSONL data file path must be specified.'
+        if not self.config.debug_json_data:
+            assert self.config.path != '', 'JSONL data file path must be specified.'
         self._tokenizer = tokenizer
         self._text_processor = TextProcessor(self.config.text_processor, tokenizer)
         self._index = self.config.example_index_at_start
@@ -138,7 +140,17 @@ class JsonDataset(object):
             return None
         return data
 
+    def debug_data_iterator(self):
+        """ Debug iterator that yields the debug text data. """
+        while True:
+            yield self.parse_json(self.config.debug_json_data), 0, 0
+
     def json_iterator(self):
+        if self.config.debug_json_data:
+            while True:
+                yield self.parse_json(self.config.debug_json_data), 0, 0
+            return
+
         with mlxu.open_file(self.config.path, 'r') as fin:
             fin.seek(self._file_loc)
             while True:

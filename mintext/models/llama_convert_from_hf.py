@@ -10,8 +10,7 @@ from scalax.utils import JaxRNG, get_float_dtype_by_name
 import torch
 import einops
 from transformers import AutoModelForCausalLM
-from mintext.model import LLaMAModel
-from mintext.llama_configs import LLaMAConfigurator
+from mintext.models import LLaMAModel, LLaMAConfigurator
 from mintext.utils import match_and_transform_dict
 
 
