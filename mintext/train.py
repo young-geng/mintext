@@ -8,6 +8,7 @@ import mlxu
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as PS
+import optax
 from scalax.utils import JaxRNG, get_float_dtype_by_name
 from flax.training.train_state import TrainState
 from transformers import AutoTokenizer
@@ -17,8 +18,7 @@ from mintext.utils import (
     JaxDistributedConfigurator, AdamConfigurator, Checkpointer,
     global_norm, cross_entropy_loss_and_accuracy, average_metrics,
 )
-from mintext.model import LLaMAShardingConfig, LLaMAModel
-from mintext.llama_configs import LLaMAConfigurator
+from mintext.models import ModelConfigurator
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
@@ -39,8 +39,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     train_dataset=JsonDataset.get_default_config(),
     eval_dataset=JsonDataset.get_default_config(),
     optimizer=AdamConfigurator.get_default_config(),
-    llama=LLaMAConfigurator.get_default_config(),
-    sharding=LLaMAShardingConfig.get_default_config(),
+    model=ModelConfigurator.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfigurator.get_default_config(),
@@ -66,19 +65,15 @@ def main(argv):
         eval_iterator = iter(eval_dataset)
 
     seq_length = dataset.seq_length
-    llama_config = LLaMAConfigurator.finalize_config(FLAGS.llama)
-    llama_sharding = LLaMAShardingConfig(FLAGS.sharding)
-
-    model = LLaMAModel(
-        llama_config,
+    model_config, model, model_sharding = ModelConfigurator.make_model_and_sharding(
+        config=FLAGS.model,
         dtype=get_float_dtype_by_name(FLAGS.dtype),
         param_dtype=get_float_dtype_by_name(FLAGS.param_dtype),
     )
-
     optimizer, lr_schedule = AdamConfigurator.get_optimizer_and_schedule(
         FLAGS.optimizer
     )
-    mesh = llama_sharding.get_mesh()
+    mesh = model_sharding.get_mesh()
 
     if FLAGS.checkpoint_path == '':
         FLAGS.checkpoint_path = logger.output_dir
@@ -87,92 +82,90 @@ def main(argv):
     @partial(
         mesh.sjit,
         in_shardings=None,
-        out_shardings=llama_sharding.get_model_sharding_rule(),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
+        out_shardings=model_sharding.get_model_sharding_rule(),
+        annotation_shardings=model_sharding.get_intermediate_sharding_rules(),
     )
     def init_fn(rng):
-        rng_generator = JaxRNG(rng)
-        params = model.init(
-            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
-            segment_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            rngs=rng_generator(LLaMAModel.rng_keys()),
-        )
-        return TrainState.create(params=params, tx=optimizer, apply_fn=None)
+        params = model.init(rng)
+        opt_state = optimizer.init(params)
+        return {
+            'params': params,
+            'opt_state': opt_state,
+            'step': jnp.array(0, jnp.int32)
+        }
 
     @partial(
         mesh.sjit,
         in_shardings=(
-            llama_sharding.get_model_sharding_rule(),
+            model_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         out_shardings=(
-            llama_sharding.get_model_sharding_rule(),
+            model_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         args_sharding_constraint=(
-            llama_sharding.get_model_sharding_rule(),
+            model_sharding.get_model_sharding_rule(),
             PS(),
-            llama_sharding.get_batch_sharding(),
+            model_sharding.get_batch_sharding(),
         ),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
+        annotation_shardings=model_sharding.get_intermediate_sharding_rules(),
         donate_argnums=(0, ),
     )
     def train_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         def loss_and_accuracy(params):
-            logits = model.apply(
+            logits = model.forward(
                 params,
                 input_ids=batch['input_tokens'],
                 attention_mask=batch['attention_mask'],
                 position_ids=batch['position_ids'],
                 segment_ids=batch['segment_ids'],
-                deterministic=False,
-                rngs=rng_generator(LLaMAModel.rng_keys()),
             )
             return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks']
             )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, accuracy), grads = grad_fn(train_state.params)
-        train_state = train_state.apply_gradients(grads=grads)
+        (loss, accuracy), grads = grad_fn(train_state['params'])
+        updates, train_state['opt_state'] = optimizer.update(
+            grads, train_state['opt_state'], train_state['params']
+        )
+        train_state['params'] = optax.apply_updates(train_state['params'], updates)
+        train_state['step'] += 1
         metrics = dict(
             loss=loss,
             accuracy=accuracy,
-            learning_rate=lr_schedule(train_state.step),
+            learning_rate=lr_schedule(train_state['step']),
             gradient_norm=global_norm(grads),
-            param_norm=global_norm(train_state.params),
+            param_norm=global_norm(train_state['params']),
         )
         return train_state, rng_generator(), metrics
 
     @partial(
         mesh.sjit,
         in_shardings=(
-            llama_sharding.get_model_sharding_rule(),
+            model_sharding.get_model_sharding_rule(),
             PS(),
             PS(),
         ),
         out_shardings=(PS(), PS()),
         args_sharding_constraint=(
-            llama_sharding.get_model_sharding_rule(),
+            model_sharding.get_model_sharding_rule(),
             PS(),
-            llama_sharding.get_batch_sharding(),
+            model_sharding.get_batch_sharding(),
         ),
-        annotation_shardings=llama_sharding.get_intermediate_sharding_rules(),
+        annotation_shardings=model_sharding.get_intermediate_sharding_rules(),
     )
     def eval_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        logits = model.apply(
-            train_state.params,
+        logits = model.forward(
+            train_state['params'],
             input_ids=batch['input_tokens'],
             attention_mask=batch['attention_masks'],
             position_ids=batch['position_ids'],
             segment_ids=batch['segment_ids'],
-            deterministic=True,
-            rngs=rng_generator(LLaMAModel.rng_keys()),
         )
         loss, accuracy = cross_entropy_loss_and_accuracy(
             logits,batch['target_tokens'], batch['loss_masks']
@@ -184,7 +177,7 @@ def main(argv):
         return rng_generator(), metrics
 
     def save_checkpoint(train_state, milestone=False):
-        step = int(jax.device_get(train_state.step))
+        step = int(jax.device_get(train_state['step']))
         checkpoint_name = f'step_{step}' if milestone else 'latest'
         # Save the main train state
         checkpointer.save_pytree(
@@ -193,14 +186,14 @@ def main(argv):
         if FLAGS.checkpoint_separate_params:
             # Optionally save the model parameters separately
             checkpointer.save_pytree(
-                train_state.params, prefix=f'params_{checkpoint_name}',
+                train_state['params'], prefix=f'params_{checkpoint_name}',
             )
         # Save dataset state and training configs
         checkpointer.save_json(
             dataset.get_state_dict(), f'dataset_state_{checkpoint_name}.json',
         )
         checkpointer.save_json(flags_config_dict.to_dict(), 'flags.json')
-        checkpointer.save_json(llama_config.to_dict(), 'llama_config.json')
+        checkpointer.save_json(model_config.to_dict(), 'model_config.json')
 
     train_state = init_fn(JaxRNG.next_rng())
 
@@ -214,18 +207,16 @@ def main(argv):
         )
     elif FLAGS.load_params_checkpoint != '':
         # Loading only the model parameters
-        model_shapes = checkpointer.get_shape_dtype_struct(train_state.params)
-        train_state = train_state.replace(params=None)  # Release memory before loading
-        train_state = train_state.replace(
-            params=checkpointer.restore_pytree(
-                FLAGS.load_params_checkpoint, model_shapes
-            )
+        model_shapes = checkpointer.get_shape_dtype_struct(train_state['params'])
+        train_state['params'] = None  # Release memory before loading
+        train_state['params'] = checkpointer.restore_pytree(
+            FLAGS.load_params_checkpoint, model_shapes
         )
 
     if FLAGS.load_dataset_state != '':
         dataset.load_state_dict(checkpointer.load_json(FLAGS.load_dataset_state))
 
-    start_step = int(jax.device_get(train_state.step))
+    start_step = int(jax.device_get(train_state['step']))
 
     if FLAGS.save_model_freq > 0:
         save_checkpoint(train_state)
