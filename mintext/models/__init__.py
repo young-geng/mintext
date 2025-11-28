@@ -1,6 +1,5 @@
 import mlxu
-from mintext.models.llama_model import LLaMAModel, LLaMAShardingConfig
-from mintext.models.llama_configs import LLaMAConfigurator
+from mintext.models.llama_model import LLaMAModel, LLaMAConfigurator, LLaMAShardingConfig
 
 
 class ModelConfigurator(object):

@@ -49,11 +49,11 @@ class AdamConfigurator(object):
     @staticmethod
     def get_default_config(updates=None):
         config = mlxu.config_dict()
-        config.init_lr = 0.0
-        config.end_lr = 0.001
+        config.init_lr_multiplier = 0.0
+        config.end_lr_multiplier = 0.1
         config.lr = 0.01
-        config.lr_warmup_steps = 2000
-        config.lr_decay_steps = 500000
+        config.lr_warmup_step_ratio = 0.05
+        config.lr_decay_steps = -1
         config.b1 = 0.9
         config.b2 = 0.95
         config.clip_gradient = 1.0
@@ -61,14 +61,22 @@ class AdamConfigurator(object):
         return mlxu.update_config_dict(config, updates)
 
     @classmethod
-    def get_optimizer_and_schedule(cls, config, weight_decay_mask=None):
+    def get_optimizer_and_schedule(cls, config, weight_decay_mask=None, total_steps=None):
         config = cls.get_default_config(config)
+        if config.lr_decay_steps > 0:
+            # Manually specified lr decay steps
+            lr_decay_steps = config.lr_decay_steps
+        else:
+            assert total_steps is not None, "Either total_steps or lr_decay_steps must be set."
+            lr_decay_steps = total_steps
+
+        lr_warmup_steps = int(config.lr_warmup_step_ratio * lr_decay_steps)
         learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=config.init_lr,
+            init_value=config.init_lr_multiplier * config.lr,
             peak_value=config.lr,
-            warmup_steps=config.lr_warmup_steps,
-            decay_steps=config.lr_decay_steps,
-            end_value=config.end_lr,
+            warmup_steps=lr_warmup_steps,
+            decay_steps=lr_decay_steps,
+            end_value=config.end_lr_multiplier * config.lr,
         )
         optimizer = optax.chain(
             optax.clip_by_global_norm(config.clip_gradient),
@@ -137,12 +145,12 @@ def get_metrics(metrics, unreplicate=False, stack=False):
         metrics = flax.jax_utils.unreplicate(metrics)
     metrics = jax.device_get(metrics)
     if stack:
-        return jax.tree_map(lambda *args: np.stack(args), *metrics)
+        return jax.tree_util.tree_map(lambda *args: np.stack(args), *metrics)
     else:
         return {key: float(val) for key, val in metrics.items()}
 
 
-def init_normal(rng, shape, scale=1.0, dtype=jnp.float32, scaling_mode='fan_out'):
+def init_normal(rng, shape, scale=1.0, dtype=jnp.float32, scaling_mode='fan_in'):
     """Initialize weights with a normal distribution."""
     if scaling_mode == 'fan_in':
         scale = scale / np.sqrt(shape[-2])  # Scale by input dimension size
@@ -188,7 +196,7 @@ def global_norm(tree):
 
 
 def average_metrics(metrics):
-    return jax.tree_map(
+    return jax.tree_util.tree_map(
         lambda *args: jnp.mean(jnp.stack(args)),
         *metrics
     )

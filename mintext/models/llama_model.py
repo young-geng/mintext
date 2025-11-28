@@ -15,7 +15,82 @@ from scalax.sharding import (
 )
 from scalax.utils import JaxRNG
 
+from mintext.models.llama_configs import STANDARD_LLAMA_CONFIGS
 from mintext.utils import init_normal
+
+
+class LLaMAConfigurator(object):
+    """ Configurator for LLaMA 1,2,3 models. """
+
+    @classmethod
+    def get_default_config(cls, updates=None):
+        config = mlxu.config_dict()
+        config.base_model = 'llama3_8b'
+        config.vocab_size = mlxu.config_placeholder(int)
+        config.hidden_size = mlxu.config_placeholder(int)
+        config.intermediate_size = mlxu.config_placeholder(int)
+        config.num_hidden_layers = mlxu.config_placeholder(int)
+        config.num_attention_heads = mlxu.config_placeholder(int)
+        config.num_key_value_heads = mlxu.config_placeholder(int)
+        config.initializer_scale = mlxu.config_placeholder(float)
+        config.rms_norm_eps = mlxu.config_placeholder(float)
+        config.max_position_embeddings = mlxu.config_placeholder(int)
+        config.rope_theta = mlxu.config_placeholder(float)
+        config.embedding_dropout = mlxu.config_placeholder(float)
+        config.feedforward_dropout = mlxu.config_placeholder(float)
+        config.attention_dropout = mlxu.config_placeholder(float)
+        config.residue_dropout = mlxu.config_placeholder(float)
+        config.remat = mlxu.config_placeholder(str)
+        config.attention_chunk_size = mlxu.config_placeholder(int)
+        config.total_params = mlxu.config_placeholder(int)
+        return mlxu.update_config_dict(config, updates)
+
+    @classmethod
+    def finalize_config(cls, config):
+        """ Apply updates on top of standard base model config. """
+        standard_config = cls.get_standard_llama_config(config.base_model)
+        for key, value in config.items():
+            if key != 'base_model' and value is not None:
+                standard_config[key] = value
+        standard_config['total_params'] = cls.compute_total_params(standard_config)
+        return standard_config
+
+    @classmethod
+    def get_standard_llama_config(cls, model_name):
+        config = mlxu.config_dict()
+        config.base_model = 'llama_7b'
+        config.vocab_size = 32000
+        config.hidden_size = 4096
+        config.intermediate_size = 11008
+        config.num_hidden_layers = 32
+        config.num_attention_heads = 32
+        config.num_key_value_heads = 32
+        config.initializer_scale = 1.0
+        config.rms_norm_eps = 1e-6
+        config.max_position_embeddings = 2048
+        config.rope_theta = 1e4
+        config.embedding_dropout = 0.0
+        config.feedforward_dropout = 0.0
+        config.attention_dropout = 0.0
+        config.residue_dropout = 0.0
+        config.remat = 'block'
+        config.attention_chunk_size = 1024
+
+        updates = STANDARD_LLAMA_CONFIGS[model_name]
+        return mlxu.update_config_dict(config, updates)
+
+    @classmethod
+    def compute_total_params(cls, config):
+        """ Compute total number of parameters excluding the word embedding. """
+        mlp_params = config.hidden_size * config.intermediate_size * 3
+        num_query_groups = config.num_attention_heads // config.num_key_value_heads
+        attention_params = (
+            config.hidden_size * config.hidden_size * 2 + # q_proj, o_proj
+            config.hidden_size * (
+                config.hidden_size // num_query_groups
+            ) * 2 # k_proj, v_proj
+        )
+        return (mlp_params + attention_params) * config.num_hidden_layers
 
 
 class LLaMAShardingConfig(object):
@@ -79,7 +154,9 @@ class LLaMAShardingConfig(object):
             'mask': PS(('replica', 'fsdp'), 'sequence'),
         }
 
-    def get_batch_sharding(self):
+    def get_batch_sharding(self, micro_batch_axis=False):
+        if micro_batch_axis:
+            return PS(None, ('replica', 'fsdp'), 'sequence')
         return PS(('replica', 'fsdp'), 'sequence')
 
 
