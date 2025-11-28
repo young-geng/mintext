@@ -298,7 +298,7 @@ class Attention:
             ),
             'o_proj': init_normal(
                 rng(),
-                (self.config.hidden_size, self.config.hidden_size // self.num_query_groups),
+                (self.config.hidden_size, self.config.hidden_size),
                 scale=self.config.initializer_scale,
                 dtype=self.param_dtype,
             ),
